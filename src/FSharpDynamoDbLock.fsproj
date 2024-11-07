@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <RootNamespace>DynamoDbLock</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="FSharpDynamoDbLock.fs" />
+    </ItemGroup>
+
+    <Import Project="..\.paket\Paket.Restore.targets" />
+</Project>

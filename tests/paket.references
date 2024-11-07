@@ -1,0 +1,5 @@
+FSharp.Core
+AWSSDK.DynamoDBv2
+Expecto
+Serilog
+Serilog.Sinks.Console
