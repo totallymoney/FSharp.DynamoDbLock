@@ -4,9 +4,6 @@ open System
 open System.Net
 open Amazon.DynamoDBv2
 open Amazon.DynamoDBv2.Model
-open Serilog
-
-open Serilog.Events
 
 module Seq =
     let toDictionary xs =
@@ -27,41 +24,39 @@ type LockSettings =
       WaitForLock : WaitForLock option }
 
 type LockError =
-    | BadPutRequest of int
-    | BadDeleteRequest of int
-    | RequestFailed of Exception
-    | KeyNotAvailable
-    | WaitForLockExpired
-    | LockNotAvailableToRelease
+    | BadPutRequest of lockKey:string * statusCode:int
+    | BadDeleteRequest of lockKey:string * statusCode:int
+    | RequestFailed of lockKey:string * Exception
+    | KeyNotAvailable of lockKey:string
+    | WaitForLockExpired of lockKey:string * attempts:int * elapsedMs:int64
+    | LockNotAvailableToRelease of lockKey:string
 
 type LockId =
     { ClientId : Guid
       LockKey : string }
 
-type AcquireMode =
-    | Retry
-    | Immediate
+module LockError =
+    let toString = function
+        | BadPutRequest (lockKey, statusCode) ->
+            $"Bad http status response code {statusCode} when attempting to acquire lock for '{lockKey}'"
+        | BadDeleteRequest (lockKey, statusCode) ->
+            $"Bad http status response code {statusCode} when attempting to release lock for '{lockKey}'"
+        | RequestFailed (lockKey, ex) ->
+            $"Error while attempting to acquire lock '{lockKey}'. {ex.ToString()}"
+        | KeyNotAvailable lockKey ->
+            $"Failed to acquire lock. '{lockKey}' is currently in use"
+        | WaitForLockExpired (lockKey, attempts, elapsedMs) ->
+            $"Failed to acquire lock for '{lockKey}'. Timed out after {attempts} attempts, in {elapsedMs} ms total"
+        | LockNotAvailableToRelease lockKey ->
+            $"Lock for '{lockKey}' could not be released. It's no longer valid"
 
 let private tryAcquireLock' (client : AmazonDynamoDBClient)
                             tableName
-                            (logger : ILogger)
                             (lockExpiry : DateTimeOffset)
                             (now : TimeProvider)
-                            acquireMode
-                            { ClientId = clientId; LockKey = key }
+                            ({ ClientId = clientId; LockKey = key } as lockId)
                             : Async<Result<LockId, LockError>> =
 
-    let successLevel =
-        match acquireMode with
-        | Retry -> LogEventLevel.Verbose
-        | Immediate -> LogEventLevel.Verbose
-
-    let failLevel =
-        match acquireMode with
-        | Retry -> LogEventLevel.Debug
-        | Immediate -> LogEventLevel.Error
-
-    let sw = System.Diagnostics.Stopwatch.StartNew()
     let expiryInUnixSeconds = lockExpiry.ToUnixTimeSeconds()
     let expireInUnixMs = lockExpiry.ToUnixTimeMilliseconds()
     let nowUnixTimeInMs = (now ()).ToUnixTimeMilliseconds()
@@ -88,42 +83,25 @@ let private tryAcquireLock' (client : AmazonDynamoDBClient)
         try
             let! result = client.PutItemAsync(request) |> Async.AwaitTask
             if result.HttpStatusCode >= HttpStatusCode.BadRequest
-            then
-                logger.Error("{Category}: Bad http status response code {StatusCode} when attempting to acquire lock for '{LockKey}'",
-                             "AcquireDynamoLock", (int result.HttpStatusCode), key)
-                return Error (BadPutRequest (int result.HttpStatusCode))
-            else
-                logger.Write(successLevel,
-                             "{Category}: Success in acquiring lock for '{LockKey}', in {Elapsed} ms",
-                             "AcquireDynamoLock", key, sw.ElapsedMilliseconds)
-                return Ok { ClientId = clientId; LockKey = key }
+            then return Error (BadPutRequest (key, (int result.HttpStatusCode)))
+            else return Ok lockId
         with
         | :? AggregateException as ex ->
             match ex.InnerExceptions.[0] with
             | :? ConditionalCheckFailedException ->
-                logger.Write(failLevel,
-                             "{Category}: Failed to acquire lock. '{LockKey}' is currently in use. Took {Elapsed} ms",
-                              "AcquireDynamoLock", key, sw.ElapsedMilliseconds)
-                return (Error KeyNotAvailable)
+                return Error (KeyNotAvailable key)
             | ex ->
-                logger.Error(ex, "{Category}: Error while attempting to acquire lock '{LockKey}'. Took {Elapsed} ms",
-                                 "AcquireDynamoLock", key, sw.ElapsedMilliseconds)
-                return (Error (RequestFailed ex))
+                return Error (RequestFailed (key, ex))
         | :? ConditionalCheckFailedException ->
-            logger.Write(failLevel,
-                         "{Category}: Failed to acquire lock. '{LockKey}' is currently in use. Took {Elapsed} ms",
-                         "AcquireDynamoLock", key, sw.ElapsedMilliseconds)
-            return Error KeyNotAvailable
+            return Error (KeyNotAvailable key)
         | ex ->
-            logger.Error(ex, "{Category}: Error while attempting to acquire lock '{LockKey}'. Took {Elapsed} ms",
-                             "AcquireDynamoLock", key, sw.ElapsedMilliseconds)
-            return (Error (RequestFailed ex))
+            return Error (RequestFailed (key, ex))
     }
 
+[<TailCall>]
 let rec private tryAcquireLockRepeatedly
     (client : AmazonDynamoDBClient)
     tableName
-    (logger : ILogger)
     lockExpiry
     wait
     (now : TimeProvider)
@@ -132,30 +110,17 @@ let rec private tryAcquireLockRepeatedly
     attemptCount = async {
 
     if now() > wait.Until then
-        logger.Warning("{Category}: Failed to acquire lock for '{LockKey}'. Timed out after {Attempts} attempts, in {Elapsed} ms total",
-                       "AcquireDynamoLock", key, attemptCount, sw.ElapsedMilliseconds)
-        return (Error WaitForLockExpired)
+        return Error (WaitForLockExpired (key, attemptCount, sw.ElapsedMilliseconds))
     else
-        let! result = tryAcquireLock' client
-                                      tableName
-                                      logger
-                                      lockExpiry
-                                      now
-                                      AcquireMode.Retry
-                                      lockId
+        let! result =
+            tryAcquireLock' client tableName lockExpiry now lockId
         match result with
-        | Ok _ ->
-            logger.Verbose("{Category}: Success in acquiring lock for '{LockKey}' after {Attempts} attempts, in {Elapsed} ms total",
-                           "AcquireDynamoLock", key, attemptCount + 1, sw.ElapsedMilliseconds)
-            return result
-        | Error KeyNotAvailable ->
-            logger.Verbose("{Category}: Waiting for attempt {Attempt} to acquire lock for '{LockKey}'. {Elapsed} ms elapsed so far",
-                           "AcquireDynamoLock", attemptCount + 1, key, sw.ElapsedMilliseconds)
+        | Ok _ -> return result
+        | Error (KeyNotAvailable _) ->
             do! Async.Sleep (int wait.CheckDelay.TotalMilliseconds)
             // tail recursive in async
             return! tryAcquireLockRepeatedly client
                                              tableName
-                                             logger
                                              lockExpiry
                                              wait
                                              now
@@ -170,28 +135,22 @@ let rec private tryAcquireLockRepeatedly
 
 let tryAcquireLock client
                    tableName
-                   (logger : ILogger)
                    (now : TimeProvider)
                    lockSettings
                    key =
     let clientId = Guid.NewGuid()
     let lockId = { ClientId = clientId; LockKey = key }
-    let logger = logger.ForContext("ClientId", clientId.ToString())
     match lockSettings.WaitForLock with
     | None ->
-        tryAcquireLock'
-            client tableName logger lockSettings.LockExpiry now AcquireMode.Immediate lockId
+        tryAcquireLock' client tableName lockSettings.LockExpiry now lockId
     | Some wait ->
         let sw = System.Diagnostics.Stopwatch.StartNew()
         tryAcquireLockRepeatedly
-            client tableName logger lockSettings.LockExpiry wait now lockId sw 0
+            client tableName lockSettings.LockExpiry wait now lockId sw 0
 
 let releaseLock (client : AmazonDynamoDBClient)
                 tableName
-                (logger : ILogger)
                 { ClientId = clientId; LockKey = key } =
-    let sw = System.Diagnostics.Stopwatch.StartNew()
-    let logger = logger.ForContext("ClientId", clientId.ToString())
     let dynamoKey =
         [ ("LockKey", AttributeValue(S = key)) ]
         |> Seq.toDictionary
@@ -209,32 +168,18 @@ let releaseLock (client : AmazonDynamoDBClient)
         try
             let! result = client.DeleteItemAsync(request) |> Async.AwaitTask
             if result.HttpStatusCode >= HttpStatusCode.BadRequest
-            then
-                logger.Error("{Category}: Bad http status response code {StatusCode} when attempting to release lock for '{LockKey}', after {Elapsed} ms",
-                             "AcquireDynamoLock", (int result.HttpStatusCode), key, sw.ElapsedMilliseconds)
-                return Error (BadDeleteRequest (int result.HttpStatusCode))
-            else
-                logger.Verbose("{Category}: Success in releasing lock for '{LockKey}', in {Elapsed} ms",
-                               "ReleaseDynamoLock", key, sw.ElapsedMilliseconds)
-                return Ok ()
+            then return Error (BadDeleteRequest (key, int result.HttpStatusCode))
+            else return Ok ()
 
         with
         | :? AggregateException as ex ->
             match ex.InnerExceptions.[0] with
             | :? ConditionalCheckFailedException ->
-                logger.Information("{Category}: Lock for '{LockKey}' could not be released. It's no longer valid. Took {Elapsed} ms",
-                                   "ReleaseDynamoLock", key, sw.ElapsedMilliseconds)
-                return (Error LockNotAvailableToRelease)
+                return Error (LockNotAvailableToRelease key)
             | ex ->
-                logger.Error(ex, "{Category}: Error while attempting to release lock '{LockKey}'. Took {Elapsed} ms",
-                                 "ReleaseDynamoLock", key, sw.ElapsedMilliseconds)
-                return (Error (RequestFailed ex))
+                return Error (RequestFailed (key, ex))
         | :? ConditionalCheckFailedException ->
-            logger.Information("{Category}: Lock for '{LockKey}' could not be released. It's no longer valid. Took {Elapsed} ms",
-                               "ReleaseDynamoLock", key, sw.ElapsedMilliseconds)
-            return (Error LockNotAvailableToRelease)
+            return Error (LockNotAvailableToRelease key)
         | ex ->
-            logger.Error(ex, "{Category}: Error while attempting to release lock '{LockKey}'. Took {Elapsed} ms",
-                             "ReleaseDynamoLock", key, sw.ElapsedMilliseconds)
-            return (Error (RequestFailed ex))
+            return Error (RequestFailed (key, ex))
     }

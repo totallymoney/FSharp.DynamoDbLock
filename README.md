@@ -11,9 +11,6 @@ fairly confident in it's capabilities.
 The easiest way to use this is to copy + paste the `src/FSharpDynamoDbLock.fs`
 file into your solution. There's currently no nuget package.
 
-This solution relies on `Serilog` for logging, but feel free to remove it or
-replace it with a different logger of your own choice.
-
 Before running the code for real you will first need to create a dynamodb table
 to store the lock data. See below.
 

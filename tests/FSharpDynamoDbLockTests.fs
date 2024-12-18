@@ -2,7 +2,6 @@
 
 open System
 open Amazon.DynamoDBv2
-open Serilog
 open Expecto
 open Expecto.Flip
 
@@ -48,14 +47,14 @@ let dynamoDbLockTests =
             let client = getClient ()
             let key = Guid.NewGuid().ToString()
             let lockId =
-                tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                tryAcquireLock client locksTableName now lockSettings key
                 |> Async.RunSynchronously
 
             lockId |>> ( fun x -> x.LockKey )
             |> Expect.equal "" (Ok key)
 
             Result.get lockId
-            |> releaseLock client locksTableName Log.Logger
+            |> releaseLock client locksTableName
             |> Async.RunSynchronously
             |> Expect.equal "" (Ok ())
 
@@ -66,14 +65,14 @@ let dynamoDbLockTests =
             Seq.replicate 10 ()
             |> Seq.iter (fun _ ->
                 let lockId =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                    tryAcquireLock client locksTableName now lockSettings key
                     |> Async.RunSynchronously
 
                 lockId |>> ( fun x -> x.LockKey )
                 |> Expect.equal "" (Ok key)
 
                 Result.get lockId
-                |> releaseLock client locksTableName Log.Logger
+                |> releaseLock client locksTableName
                 |> Async.RunSynchronously
                 |> Expect.equal "" (Ok ())
             )
@@ -90,15 +89,14 @@ let dynamoDbLockTests =
             // try to acquire and release several locks in parallel
             Seq.replicate 25 ()
             |> Seq.map (fun _ -> async {
-                let! lockId =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                let! lockId = tryAcquireLock client locksTableName now lockSettings key
 
                 // sleep for up to 50ms (simulate work being done)
                 do! Async.Sleep (int (random.NextDouble() * 50.0))
 
                 return!
                     match lockId with
-                    | Ok lockId -> releaseLock client locksTableName Log.Logger lockId
+                    | Ok lockId -> releaseLock client locksTableName lockId
                     | Error err -> async { return Error err }
             })
             |> Async.Parallel
@@ -121,14 +119,14 @@ let dynamoDbLockTests =
                 Seq.replicate 25 ()
                 |> Seq.map (fun _ -> async {
                     let! lockId =
-                        tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                        tryAcquireLock client locksTableName now lockSettings key
 
                     // sleep for up to 50ms (simulate work being done)
                     do! Async.Sleep (int (random.NextDouble() * 200.0))
 
                     return!
                         match lockId with
-                        | Ok lockId -> releaseLock client locksTableName Log.Logger lockId
+                        | Ok lockId -> releaseLock client locksTableName lockId
                         | Error err -> async { return Error err }
                 })
                 |> Async.Parallel
@@ -137,8 +135,14 @@ let dynamoDbLockTests =
 
             // make sure all the errors are timeouts
             errors
+            |> Seq.map (function
+                // map the errors to make them easy to test, there should
+                // be at least 10 attempts for each
+                | WaitForLockExpired (key, attempts, _) ->
+                    WaitForLockExpired (key, min attempts 10, 0)
+                | err -> err)
             |> Seq.distinct
-            |> Expect.sequenceEqual "" [ WaitForLockExpired ]
+            |> Expect.sequenceEqual "" [ WaitForLockExpired (key, 10, 0) ]
 
             // and there should be quite a lot of them
             errors
@@ -163,14 +167,14 @@ let dynamoDbLockTests =
                     do! Async.Sleep (int (random.NextDouble() * 2000.0))
 
                     let! lockId =
-                        tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                        tryAcquireLock client locksTableName now lockSettings key
 
                     // sleep for up to 50ms (simulate work being done)
                     do! Async.Sleep (int (random.NextDouble() * 50.0))
 
                     return!
                         match lockId with
-                        | Ok lockId -> releaseLock client locksTableName Log.Logger lockId
+                        | Ok lockId -> releaseLock client locksTableName lockId
                         | Error err -> async { return Error err }
                 })
                 |> Async.Parallel
@@ -180,7 +184,7 @@ let dynamoDbLockTests =
             // make sure all the errors unavailable keys
             errors
             |> Seq.distinct
-            |> Expect.sequenceEqual "" [ KeyNotAvailable ]
+            |> Expect.sequenceEqual "" [ KeyNotAvailable key ]
 
             // and there should be quite a lot of them
             errors
@@ -196,17 +200,15 @@ let dynamoDbLockTests =
             let key = Guid.NewGuid().ToString()
 
             async {
-                let! _ =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                let! _ = tryAcquireLock client locksTableName now lockSettings key
 
                 // try to acquire the same lock again - it won't be available
-                let! lockId2 =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                let! lockId2 = tryAcquireLock client locksTableName now lockSettings key
 
                 return lockId2
             }
             |> Async.RunSynchronously
-            |> Expect.equal "" (Error LockError.KeyNotAvailable)
+            |> Expect.equal "" (Error (LockError.KeyNotAvailable key))
 
         testCase "should prevent lock being taken with retry if still locked" <| fun _ ->
             let client = getClient ()
@@ -218,17 +220,18 @@ let dynamoDbLockTests =
             let key = Guid.NewGuid().ToString()
 
             async {
-                let! _ =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                let! _ = tryAcquireLock client locksTableName now lockSettings key
 
                 // try to acquire the same lock again - it won't be available within the 1 second
-                let! lockId2 =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
-
-                return lockId2
+                return! tryAcquireLock client locksTableName now lockSettings key
             }
             |> Async.RunSynchronously
-            |> Expect.equal "" (Error LockError.WaitForLockExpired)
+            |> Expect.wantError ""
+            |> function
+                | LockError.WaitForLockExpired (errorKey, attempts, _) ->
+                    errorKey |> Expect.equal "" key
+                    (attempts, 6) |> Expect.isGreaterThan ""
+                | err -> failtestf $"Expected a WaitForLockExpired, got {err} instead"
 
         testCase "should allow lock to be taken immediately after original expires, even if not released" <| fun _ ->
             let client = getClient ()
@@ -240,12 +243,12 @@ let dynamoDbLockTests =
 
             async {
                 let! _ =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                    tryAcquireLock client locksTableName now lockSettings key
 
                 do! Async.Sleep 1001
 
                 let! lockId2 =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                    tryAcquireLock client locksTableName now lockSettings key
 
                 return lockId2
             }
@@ -263,10 +266,10 @@ let dynamoDbLockTests =
 
             async {
                 let! _ =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                    tryAcquireLock client locksTableName now lockSettings key
 
                 let! lockId2 =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                    tryAcquireLock client locksTableName now lockSettings key
 
                 return lockId2
             }
@@ -284,19 +287,19 @@ let dynamoDbLockTests =
 
             async {
                 let! lockId1 =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                    tryAcquireLock client locksTableName now lockSettings key
 
                 let! _ =
-                    tryAcquireLock client locksTableName Log.Logger now lockSettings key
+                    tryAcquireLock client locksTableName now lockSettings key
 
                 // Lock 1 won't have the lock any more at this point,
                 // it's expired and been taken over by lock 2
                 return!
                     Result.get lockId1
-                    |> releaseLock client locksTableName Log.Logger
+                    |> releaseLock client locksTableName
             }
             |> Async.RunSynchronously
-            |> Expect.equal "" (Error LockError.LockNotAvailableToRelease)
+            |> Expect.equal "" (Error (LockError.LockNotAvailableToRelease key))
 
         testCase "should not release if no lock" <| fun _ ->
             let client = getClient ()
@@ -305,7 +308,8 @@ let dynamoDbLockTests =
                 { LockKey = Guid.NewGuid().ToString()
                   ClientId = Guid.NewGuid() }
 
-            releaseLock client locksTableName Log.Logger lockId
+            releaseLock client locksTableName lockId
             |> Async.RunSynchronously
-            |> Expect.equal "" (Error LockError.LockNotAvailableToRelease)
+            |> Expect.equal ""
+                   (Error (LockError.LockNotAvailableToRelease lockId.LockKey))
     ]

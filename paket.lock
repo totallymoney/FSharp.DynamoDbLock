@@ -9,6 +9,3 @@ NUGET
       Mono.Cecil (>= 0.11.4 < 1.0)
     FSharp.Core (8.0.401)
     Mono.Cecil (0.11.6)
-    Serilog (4.1)
-    Serilog.Sinks.Console (6.0)
-      Serilog (>= 4.0)
