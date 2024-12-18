@@ -35,6 +35,64 @@ LocksDynamoDBTable:
       Enabled: True
 ```
 
+## Usage
+
+Call `tryAcquireLock` to take a distributed lock. 
+
+The parameters are:
+* `client`: with a `AmazonDynamoDBClient` that has already been setup with the correct configuration, credentials and region
+* `tableName`: the name of the dynamo db to store the lock. See above for how this table should be defined.
+* `now`: A thunk that should return the current time. i.e. `(fun _ -> DateTimeOffest.Now)`
+* `lockSettings`: of type `LockSettings` described further down.
+* `key`: the "id" you give lock, so only one caller can do something with it at a time. Often this will be something like a _CustomerId_ so no other process can acquire a lock for the same customer while you're performing an operation with it.
+
+This will return a `LockKey` (`Async<Result<LockKey,LockError>>` to be specific) which you can use to release the lock once you've finished with it.
+
+The `LockKey` is made up of two parts, the `key` that you provided earlier, and a random guid `ClientId`. The clientId is used to identify the client that took out the lock. You shouldn't need it.
+
+If a lock cannot be acquired, it will return a `LockError` DU, with one of 5 different types of errors.
+`WaitForLockExpired` is the most standard response and indicates someone else is still holding the lock. The other errors are more infrastructure failures.
+
+This function has quite a few parameters, but in practice you should _partially apply_ all except the `key` before using it.
+
+`releaseLock`:
+ 
+Once you've finished with the lock call `releaseLock` to indicate that the client has finished with the lock, and something else can take it.
+
+### LockSettings
+
+This library is fairly simple, but there are a few things that can be configured.
+
+The minimal option is to only set the LockExpiry time. i.e.
+
+```
+{ LockExpiry = DateTimeOffset.Now.AddSeconds 20.0
+  WaitForLock = None }
+```
+
+This will create a lock that will timeout in 20 seconds, but if the lock is already taken it will give up and return immediately.
+
+Note: This library doesn't do anything complex like keep-alives, so you only have a limited time to perform your actions before the lock will be released automatically. It's important to set a good expiry time that will last long enough that to complete your operations. But not so long that a disconnected or aborted client will halt your system when it can't send a lock release .
+
+The `WaitForLock` setting will cause the `tryAcquireLock` request to keep reattempting to acquire the lock if it's not immediately available. e.g.
+
+```
+{ LockExpiry = DateTimeOffset.Now.AddSeconds 20.0
+  WaitForLock =
+    Some { Until = DateTimeOffset.Now.AddSeconds 18.0
+           CheckDelay = TimeSpan.FromMilliseconds 20.0 } }
+```  
+
+Looking first at `CheckDelay`, this is how often we should wait before attempting to acquire the lock if we can't acquire it the first time. From the example above this does NOT mean we'll send a request every 100ms. There's the overhead and round trip time of each request which will add on top of this delay. The 100ms in the example an absolute minimum.
+
+The number you want to set this to is going to be dependent on how time sensitive your operation is, how much you want to spend on Dynamo processing costs, and how likley it is to be locked. We regularly use `20ms` in production, as we don't expect to hit locks very often, and we don't want to wait long. I wouldn't suggest going over 100ms unless you expect very long lock times (greater than 60 seconds).
+
+The other setting, `Until` is a limit to how long `tryAcquireLock` will keep attempting to get a lock. There is no queueing mechanism with this library, so if a lock has a lot of contention it could be continuously acquired by other clients while we're trying to acquire it. It's not a good design to allow a process to get stuck indefinitely, we could just build up more and more contention behind the one lock. So it should fail after a while.
+
+For our usages we keep this fairly low since we're using lambdas with their own short timeouts. In our case it's better to give the lambda time to handle the issue than to wait until the lambda itself times out and hold up the rest of the system.
+
+
+
 ## Development
 
 Run `dotnet tool restore && dotnet paket restore` to setup the solution.
