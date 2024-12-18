@@ -55,9 +55,13 @@ If a lock cannot be acquired, it will return a `LockError` DU, with one of 5 dif
 
 This function has quite a few parameters, but in practice you should _partially apply_ all except the `key` before using it.
 
-`releaseLock`:
- 
-Once you've finished with the lock call `releaseLock` to indicate that the client has finished with the lock, and something else can take it.
+### Release Lock
+
+Once you've finished with the lock it's critical that you call `releaseLock` to indicate that the client has finished with the lock, and something else can take it.
+
+If you don't call `releaseLock` a client will have to wait around until the lock expires before they can get that resource.
+
+Because it's important that this is always called, you should wrap any work done after calling `tryAcquireLock` with error handling, so that the lock can still be release in the case of an exception or error.
 
 ### LockSettings
 
