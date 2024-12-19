@@ -6,6 +6,45 @@ This library has been in use at TotallyMoney for several years. We have 5
 million+ customers, and this code is hit across multiple microservices. We're
 fairly confident in it's capabilities.
 
+## Example
+
+Below is an example of what the acquiring and releasing a lock might look like in practice, along with using `FsToolkit.ErrorHandling`'s `asyncResult` computation expression.
+
+```fsharp
+open FsToolkit.ErrorHandling
+
+// Setup
+let now = (fun () -> DateTimeOffset.Now)
+
+let lockSettings =
+    { LockExpiry = now().AddSeconds 20.0
+      WaitForLock =
+        Some { Until = now().AddSeconds 18.0
+               CheckDelay = TimeSpan.FromMilliseconds 20.0 } }
+
+let dynamoClient = new AmazonDynamoDBClient(RegionEndpoint.EUWest1)
+
+// Partially apply functions for easier use
+let tryAcquireLock =
+    tryAcquireLock dynamoClient "LocksDynamoDBTable" now lockSettings
+    
+let releaseLock = releaseLock dynamoClient "LocksDynamoDBTable"
+
+// call myImportantCode, via a distributed lock
+asyncResult {
+    let! lockId = tryAcquireLock "myCustomerId"
+    try
+        let! result = myImportantCode ()
+        do! releaseLock lockId
+        return result
+    with ex ->
+        do! releaseLock lockId
+        reraise ()
+}
+
+```
+
+
 # Install/Setup
 
 The easiest way to use this is to copy + paste the `src/FSharpDynamoDbLock.fs`
@@ -46,9 +85,11 @@ The parameters are:
 * `lockSettings`: of type `LockSettings` described further down.
 * `key`: the "id" you give lock, so only one caller can do something with it at a time. Often this will be something like a _CustomerId_ so no other process can acquire a lock for the same customer while you're performing an operation with it.
 
-This will return a `LockKey` (`Async<Result<LockKey,LockError>>` to be specific) which you can use to release the lock once you've finished with it.
+Note: `tryAcquireLock` is a async function using F#'s Async type, so you'll need to resolve the Async before the lock will take effect.
 
-The `LockKey` is made up of two parts, the `key` that you provided earlier, and a random guid `ClientId`. The clientId is used to identify the client that took out the lock. You shouldn't need it.
+This will return a `LockId` (`Async<Result<LockId,LockError>>` to be specific) which you can use to release the lock once you've finished with it.
+
+The `LockId` is made up of two parts, the `key` that you provided earlier, and a random guid `clientId`. The clientId is used to identify who took out the lock. You shouldn't need to deal with it in your code.
 
 If a lock cannot be acquired, it will return a `LockError` DU, with one of 5 different types of errors.
 `WaitForLockExpired` is the most standard response and indicates someone else is still holding the lock. The other errors are more infrastructure failures.
@@ -58,6 +99,13 @@ This function has quite a few parameters, but in practice you should _partially 
 ### Release Lock
 
 Once you've finished with the lock it's critical that you call `releaseLock` to indicate that the client has finished with the lock, and something else can take it.
+
+The parameters are:
+* `client`: a valid `AmazonDynamoDBClient` to access the lock table.
+* `tableName`: the same table you called `tryAcquireLock` with.
+* `lockId`: the `LockId` that `tryAcquireLock` returned.
+ 
+Note: just like `tryAcquireLock`, `releaseLockz is a async function using F#'s Async type, so you'll need to resolve the Async before the lock will take effect.
 
 If you don't call `releaseLock` a client will have to wait around until the lock expires before they can get that resource.
 
@@ -69,7 +117,7 @@ This library is fairly simple, but there are a few things that can be configured
 
 The minimal option is to only set the LockExpiry time. i.e.
 
-```
+```fsharp
 { LockExpiry = DateTimeOffset.Now.AddSeconds 20.0
   WaitForLock = None }
 ```
@@ -80,7 +128,7 @@ Note: This library doesn't do anything complex like keep-alives, so you only hav
 
 The `WaitForLock` setting will cause the `tryAcquireLock` request to keep reattempting to acquire the lock if it's not immediately available. e.g.
 
-```
+```fsharp
 { LockExpiry = DateTimeOffset.Now.AddSeconds 20.0
   WaitForLock =
     Some { Until = DateTimeOffset.Now.AddSeconds 18.0
@@ -94,7 +142,6 @@ The number you want to set this to is going to be dependent on how time sensitiv
 The other setting, `Until` is a limit to how long `tryAcquireLock` will keep attempting to get a lock. There is no queueing mechanism with this library, so if a lock has a lot of contention it could be continuously acquired by other clients while we're trying to acquire it. It's not a good design to allow a process to get stuck indefinitely, we could just build up more and more contention behind the one lock. So it should fail after a while.
 
 For our usages we keep this fairly low since we're using lambdas with their own short timeouts. In our case it's better to give the lambda time to handle the issue than to wait until the lambda itself times out and hold up the rest of the system.
-
 
 
 ## Development
